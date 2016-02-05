@@ -3,9 +3,73 @@
 
 sam.csize(){
         if [ ! -f $1.bai ];then
+		echo "generating index $1.bai .. " >&2
                 samtools index $1;
         fi
         samtools idxstats $1 | awk -v OFS="\t" '$1 != "*" && $3 > 0 { print $1,$2;}'
+}
+
+sam.fixchr(){
+usage="
+FUNCT: produce a bam file correcting chromosome names 
+USAGE: $FUNCNAME <bam> <genome>
+	<genome> : hisat2_hg19
+"; if [ $# -ne 2 ]; then echo "$usage"; return; fi
+
+	if [ $2 = "hisat2_hg19" ];then
+		samtools view -hS $1 \
+		| perl -e 'use strict;
+			sub f{
+				my ($a)= @_;
+				if($a eq "*" || $a=~/GL/){
+				}else{
+					$a=~s/(\d+|MT|X|Y)/chr$1/g; 
+					$a=~s/MT/M/g; 
+				}
+				return $a;
+			}
+			while(<STDIN>){ chomp; my @a=split /\t/,$_;
+				if($_=~/^\@SQ/){ 
+					if($a[1]=~/SN:(\S+)/){
+						$a[1]="SN:".f($1);
+					}
+				}else{
+					$a[2]=f($a[2]);
+				}
+				print join ("\t",@a),"\n";
+			}
+		' | samtools view -bh -
+	else
+		echo "$2 is unknown">&2
+		echo "$usage";	
+	fi
+}
+sam.each_chrom(){
+usage="
+USAGE: $FUNCNAME <bam/sam> <samtools options> '<functions>'
+"; if [ $# -ne 3 ];then echo "$usage"; return; fi
+	for chrom in `sam.csize $1 | cut -f 1`;do
+		echo ".. $chrom" >&2;
+		cmd="samtools view $2 $1 $chrom | $3"
+		eval "$cmd";
+        done
+}
+
+
+sam.csize(){
+        if [ ! -f $1.bai ];then
+                samtools index $1;
+        fi
+        samtools idxstats $1 | awk -v OFS="\t" '$1 != "*" && $3 > 0 { print $1,$2;}'
+}
+
+
+sam.bed12(){
+usage="
+USAGE: $FUNCNAME <samtools options> <bam|sam>
+"
+if [ $# -lt 1 ];then echo "$usage"; return; fi
+	samtools view -b $@ | bamToBed -bed12
 }
 
 # reference from https://samtools.github.io/hts-specs/SAMv1.pdf

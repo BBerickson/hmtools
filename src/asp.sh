@@ -46,85 +46,231 @@ asp.view tmp.gene tmp.read
 rm tmp.read tmp.gene
 }
 asp.spi(){
-usage=" $FUNCNAME <intron.bed6> <read.bed12> <opt>
-	<opt>: 0: null, 1:count on the same strand, 2: count on the opposite strand
-			
+usage=" 
+ FUNCT: Calculate SPI
+ OUTPU: bed6 a,b,c 2*a/(b+c)
+ USAGE: $FUNCNAME <intron.bed6> <read.bed12> <strand> [<count>]
+	<strand>: 0: null, 1:count on the same strand, 2: count on the opposite strand
+	<count> : 0: use as it is (default), 1: count as 1, 2: phred score
+	               (a)	
 		_/     sp       \_
-	[        ]--------------[           ]
-                ___     un      ___
+	[    5'  ]--------------[   3'      ]
+               _(b)_          _(c)_
 "
 	if [ $# -lt 3 ];then echo "$usage"; return; fi
 	local S=${3/1/"-s"}; S=${S/2/"-S"};
 	local tmpd=`mymktempd`; 
 	#local tmpd=tmpd; rm -rf $tmpd; mkdir -p $tmpd
-	mycat $1 > $tmpd/a
-	mycat $2 > $tmpd/b
+	mycat $1 | bed.enc - > $tmpd/i
+	bed.5p $tmpd/i > $tmpd/i.5
+	bed.3p $tmpd/i > $tmpd/i.3
+	mycat $2 | bed.score - ${4:-"0"} \
+		| awk -v OFS="\t" -v O=$tmpd/r '{ n=1; if($10 > 1){ n=2;} print $0 >> O"."n; }'
 
 	## count spliced
-	bed.intron $tmpd/b \
-		| intersectBed -a $tmpd/a -b stdin -wa -wb -f 1 -F 1 $S \
-		| awk -v OFS="@" '{print $1,$2,$3,$4,$5,$6,"\t"$11;}' | stat.sum | sort -k1,1 > $tmpd/c
+	bed.intron $tmpd/r.2 \
+		| intersectBed -a $tmpd/i -b stdin -wa -wb -f 1 -F 1 $S \
+		| cut -f4,11 | stat.sum - | sort -k 1,1  > $tmpd/a 
 
 	## count unspliced
-	bed.exon $tmpd/b \
-		| intersectBed -a $tmpd/a -b stdin -wa -wb $S \
-		| awk -v OFS="@" '$8 < $2 && $9 > $2 +1 || $8 < $3-1 && $9 > $3 {
-			print $1,$2,$3,$4,$5,$6,"\t"$11;
-		}' | stat.sum | sort -k 1,1 > $tmpd/d
+	intersectBed -a $tmpd/i.5 -b $tmpd/r.1 -wa -wb $S \
+		| cut -f4,11 | stat.sum - | sort -k 1,1 > $tmpd/b
+
+	intersectBed -a $tmpd/i.3 -b $tmpd/r.1 -wa -wb $S \
+		| cut -f4,11 | stat.sum - | sort -k 1,1 > $tmpd/c
 	
-	join -a 1 -a 2 -e 0 -o 0,1.2,2.2 $tmpd/c $tmpd/d | tr "@ " "\t"	
+	join -a 1 -a 2 -e 0 -o 0,1.2,2.2 $tmpd/a $tmpd/b \
+	| join -a 1 -a 2 -e0 -o 0,1.2,1.3,2.2 - $tmpd/c \
+	| awk '{v=$3+$4; if(v==0){ v="inf";}else{ v=2*$2/v;}  print $1,$2,$3,$4,v;}' \
+	| tr "@ " "\t"	
 
 	rm -rf $tmpd;
 }
+asp.spi.test(){
+echo \
+"c	100	200	intron1	0	+
+c	100	199	intron2	0	+" > tmp.intron
+echo \
+"c	90	210	r1	10	+	90	210	0,0,0	2	10,10	0,110
+c	189	199	r2	1	+	190	200	0,0,0	1	10	0
+c	190	200	r3	1	+	190	200	0,0,0	1	10	0
+c	191	201	r4	1	+	190	200	0,0,0	1	10	0
+c	199	209	r5	1	+	190	200	0,0,0	1	10	0
+c	200	210	r6	1	+	190	200	0,0,0	1	10	0
+c	201	211	r7	1	+	190	200	0,0,0	1	10	0" > tmp.r
+head tmp.*
+echo "==> result"
+	asp.spi tmp.intron tmp.r 1 
+	rm tmp.intron tmp.r
+}
 
 asp.3ss(){ 
-usage=" $FUNCNAME <intron.bed6> <read.bed6> <window> <strand> 
-	<strand>: 0, 1(same strand), 2(opposite strand) 
+usage=" 
+ FUNCT: calculate 3SS statistics for each intron
+ OUTPU: intron.bed6 a,b 1 - b/a
+ USAGE: $FUNCNAME <intron.bed6> <read.bed12> <window> <strand> [<count>]
 	<window>: windowsize for a and b boundaries 
+	<strand>: 0, 1(same strand), 2(opposite strand) 
+	<count> : 0: use as it is (default), 1: count as 1, 2: phred score
+
+
+# >>>>> : read
+# >>>>>----->>>>> : splicing read
+# [     ] : exon
+# ------- : intron
+# |-----| : predefined window (e.g., 25bp)
+
+# 3SS = 1- #(a)/#(b), [-inf, 1]
+
+                         |--(a)--|--(b)--|
+ [  5' exon    ]-----------------[   3' exon     ]
+                     >>>>>      >>>>>           (support a)
+                                 >>>>>   >>>>>  (support b)
+          >>>>>>----------------->>>>>>         (support b)
+             >>>>>>-------------->>>>>>         (support b or not)
+          >>>>>>--------------------->>>>>>     (support none)
+
+"
+	if [ $# -lt 4 ];then echo "$usage"; return; fi
+	local W=$3;
+	local S=${4/1/"-s"}; S=${S/2/"-S"};
+
+	local tmpd=`mymktempd`;
+	mycat $1 | bed.enc - > $tmpd/i 
+	bed.3p $tmpd/i | bed.flank - $(( $W -1 )) 0 1  > $tmpd/i.a
+	bed.3p $tmpd/i | bed.flank - -1 $W 1 > $tmpd/i.b 
+	mycat $2 | bed.score - ${5:-"0"} \
+		| awk -v OFS="\t" -v O=$tmpd/r '{ n=1; if($10 > 1){ n=2;} print $0 >> O"."n; }'
+
+	intersectBed -a $tmpd/i.a -b $tmpd/r.1 $S -wa -wb \
+		| cut -f4,11 | stat.sum - | sort -k1,1 > $tmpd/a 	
+	intersectBed -a $tmpd/i.b -b $tmpd/r.1 $S -wa -wb \
+		| awk '$6=="+" && $8>=$2 || $6=="-" && $9<=$3' \
+		| cut -f4,11 | stat.sum - | sort -k1,1 > $tmpd/b 	
+
+	bed.intron $tmpd/r.2 \
+		| intersectBed -a $tmpd/i -b stdin $S -wa -wb \
+		| awk '$6=="+" && $9==$3 || $6=="-" && $8==$2' \
+		| cut -f 4,11 | stat.sum - | sort -k1,1 > $tmpd/c
+
+	join -a 1 -a 2 -e 0 -o 0,1.2,2.2 $tmpd/a $tmpd/b \
+	| join -a 1 -a 2 -e 0 -o 0,1.2,1.3,2.2 - $tmpd/c \
+	| awk '{v=$3+4; if(v==0){ v="-inf";}else{ v=1 - $2/v;}  print $1,$2","$3+$4,v;}' \
+	| tr "@ " "\t"
+	
+	rm -rf $tmpd
+}
+asp.3ss.test(){ 
+echo \
+"c	100	200	intron1	0	+
+c	100	199	intron2	0	+" > tmp.intron
+echo \
+"c	90	210	r1	1	+	90	210	0,0,0	2	10,10	0,110
+c	80	210	r2	1	+	80	210	0,0,0	2	10,10	0,120
+c	189	199	r3	1	+	190	200	0,0,0	1	10	0
+c	190	200	r4	1	+	190	200	0,0,0	1	10	0
+c	191	201	r5	1	+	190	200	0,0,0	1	10	0
+c	199	209	r6	1	+	190	200	0,0,0	1	10	0
+c	200	210	r7	1	+	190	200	0,0,0	1	10	0
+c	201	211	r8	1	+	190	200	0,0,0	1	10	0" > tmp.r
+head tmp.*
+echo "==> result"
+	asp.3ss tmp.intron tmp.r 10 1 
+	rm tmp.intron tmp.r
+}
+asp.3ss_lessfp(){ 
+usage="
+FUNNC: calculate 3ss with less false positives caused by:
+	1. introns w/o splicing reads 
+	2. wrong 5/3 \' junctions
+	3. overlapping reads at the 3\' end 
+
+USAGE: $FUNCNAME <intron.bed6> <read.bed12> <window> <strand>
+	<window>: windowsize for a and b boundaries 
+	<strand>: 0, 1(same strand), 2(opposite strand) 
 
                      |---a---|---b---|
 	[    ]---------------[             ]
+	   \                 /       ( wrong 5\' splicing )
+	     \                   /   ( wrong 3\' splicing )
 	OUTPUT: intron.bed6 + a + b 
 "
 	if [ $# -lt 4 ];then echo "$usage"; return; fi
-	local S=${3/1/"-s"}; S=${S/2/"-S"};
-	local W=$4;
+	local W=$3;
+	local S=${4/1/"-s"}; S=${S/2/"-S"};
 
 	tmpd=`mymktempd`;
 	#tmpd=tmpd; mkdir -p $tmpd; 
-	mycat $1 | bed.3p - | sort -u | awk -v OFS="\t" '{ $4=$1";"$2";"$3";"$4";"$5";"$6;} 1' > $tmpd/a
-	bed.exon $2 > $tmpd/b; 
-	bed.flank $tmpd/a  $(( $W -1 )) 0 1 > $tmpd/a.u
-	bed.flank $tmpd/a -1 $W 1 > $tmpd/a.s
-	bed.count $tmpd/a.u $tmpd/b $S | cut -f 4,7 | sort -u -k1,1 > $tmpd/x 	
-	bed.count $tmpd/a.s $tmpd/b $S | cut -f 4,7 | sort -u -k1,1 > $tmpd/y
-	join -a 1 -a 2 -e 0 -o 0,1.2,2.2 $tmpd/x $tmpd/y | tr " ;" "\t" 
+	mycat $1 | awk -v OFS="\t" '{ $4=$1"@"$2"@"$3"@"$4"@"$5"@"$6;} 1' > $tmpd/a
+	mycat $2 > $tmpd/b
+	awk '$10==1' $tmpd/b | cut -f1-6 > $tmpd/b.1
+	
+	## junctio counts
+	bed.intron $tmpd/b | intersectBed -a $tmpd/a -b stdin -f 1 -F 1 $S -wa -wb \
+	| awk -v OFS="\t" '{ print $4,$11;}' | stat.sum - > $tmpd/c.j
+
+	cat $tmpd/c.j | tr "@" "\t" | awk -v OFS="\t" '{ $4=$1"@"$2"@"$3"@"$4"@"$5"@"$6;} 1' \
+	| bed.3p - | bed.flank - $(( $W -1))  $W 1 \
+	| intersectBed -a stdin -b $tmpd/b.1 -wa -wb $S \
+	| perl -e 'use strict; my $W='$W'; my %res=();
+		while(<STDIN>){ chomp; my @a=split/\t/,$_;
+			## bed7 + bed6
+			my ($s, $e) = ($a[1],$a[2]);
+			my ($rs, $re) = ($a[8],$a[9]);
+
+			my $x="x";
+			if($s + $W < $rs ){ $x="b";		
+			}elsif( $s + $W >= $re ){ $x="a"; }
+			if($a[5] eq "-"){
+				if($x eq "a"){ $x = "b";}
+				elsif($x eq "b" ){ $x = "a";}
+			}	
+			$res{$a[3]}{"j"} = $a[6];
+			$res{$a[3]}{$x} += $a[11];
+		}
+		foreach my $k (keys %res){
+			my $a=defined $res{$k}{"a"} ? $res{$k}{"a"} : 0;
+			my $b=defined $res{$k}{"b"} ? $res{$k}{"b"} : 0;
+			my $c=defined $res{$k}{"j"} ? $res{$k}{"j"} : 0;
+			print join("\t", split /@/,$k),"\t",$a,"\t",$b+$c,"\n";
+		}
+	'
 	rm -rf $tmpd
 }
-3ss_v2(){ 
-usage=" $FUNCNAME <intron.bed6> <read.bed6> <window> [options]
-  [options]: 
-	-sm (count the reads with introns on the same strand)
-	-Sm (count the reads with introns on the opposite strand )
-	
-	               | x  | y |
-	[    ]--------------[           ]
-"
-	if [ $# -lt 2 ];then echo "$usage"; return; fi
-	local w=${3:-25};
-	local opt=" -w $w "${4:-""};
-	windowBed -a $1 -b $2 $opt  \
-	| awk -v OFS=";" -v w=$w '{
-		x=0;y=0;
-		if( $6=="+" && $9>$3-w && $9 <= $3 || $6=="-" && $8 >= $2 && $8 < $2+w){
-			x += $11;
-		}else if( $6=="+" && $8 >= $3 || $6=="-" && $9 <= $2){
-			y += $11;
-		}
-		if( x+y > 0){
-			print $1,$2,$3,$4,$5,$6"\t"x"\t"y;
-		}
-	}' | sort -k1,1 | groupBy -g 1 -c 2,3 -o sum,sum | tr ";" "\t" 
+aso.cosi(){
+	## BED: 2-3: intron boundary, 5th: exon coordinates
+	##      /    a     \         /   b     \ 
+	##               __c__     __d__       
+	##      /               e              \
+	##     ]------------[       ]-----------[
+    BED=$1; BAM=$2;
+    chroms=( `cut -f1 $BED | sort -u` )
+    TMP=`make_temp`
+    for CHROM in ${chroms[@]}
+    do
+        echo " $CHROM .." >&2
+        awk -v CHROM=$CHROM '$1==CHROM' $BED > $TMP
+        samtools view -bq 255 $BAM $CHROM | bamToBed -bed12 \
+		| intersectBed -a $TMP -b stdin -wa -wb \
+		| awk -v OFS="\t" '{ split($17,l,",");split($18,s,",");split($5,ex,",");
+			is=$2-1;ie=$3; es=ex[1];ee=ex[2]-1; 
+			a=0;b=0;c=0;d=0;e=0;
+			for(i=1;i<=$16;i++){ ## count unsplicing events
+					rs=$8+s[i]; re=rs+l[i]-1;
+					if(rs < es && re > es){ c=1;
+					}else if(rs < ee && re > ee){ d=1;}
+			}
+			for(i=2;i<=$16;i++){ ## count splicing events
+					rs=$8+s[i-1]+l[i-1]-1; re=$8+s[i];
+					if(rs==is && re== es){ a=1;
+					}else if(rs==ee && re == ie){ b=1;
+					}else if(rs ==is && re == ie){ e=1;}
+			}
+			if(a+b+c+d+e > 0){
+				print $1,$2,$3,$4,$5,$6,a,b,c,d,e;
+			}
+		}'  | groupBy -g 1,2,3,4,5,6 -c 7,8,9,10,11 -o sum,sum,sum,sum,sum
+	done
 }
 gen_bed(){
 	echo "hi" | awk -v OFS="\t" -v s=$1 -v e=$2 -v l=$3 '{
@@ -305,41 +451,6 @@ count_a53ss(){
 #head -n 100 a53ss.bed  > tmp
 #count_a53ss tmp ../Tophat/Wt1/accepted_hits.bam -wa -wb
 
-count_coSI(){
-	## BED: 2-3: intron boundary, 5th: exon coordinates
-	##      /    a     \         /   b     \ 
-	##               __c__     __d__       
-	##      /               e              \
-	##     ]------------[       ]-----------[
-    BED=$1; BAM=$2;
-    chroms=( `cut -f1 $BED | sort -u` )
-    TMP=`make_temp`
-    for CHROM in ${chroms[@]}
-    do
-        echo " $CHROM .." >&2
-        awk -v CHROM=$CHROM '$1==CHROM' $BED > $TMP
-        samtools view -bq 255 $BAM $CHROM | bamToBed -bed12 \
-		| intersectBed -a $TMP -b stdin -wa -wb \
-		| awk -v OFS="\t" '{ split($17,l,",");split($18,s,",");split($5,ex,",");
-			is=$2-1;ie=$3; es=ex[1];ee=ex[2]-1; 
-			a=0;b=0;c=0;d=0;e=0;
-			for(i=1;i<=$16;i++){ ## count unsplicing events
-					rs=$8+s[i]; re=rs+l[i]-1;
-					if(rs < es && re > es){ c=1;
-					}else if(rs < ee && re > ee){ d=1;}
-			}
-			for(i=2;i<=$16;i++){ ## count splicing events
-					rs=$8+s[i-1]+l[i-1]-1; re=$8+s[i];
-					if(rs==is && re== es){ a=1;
-					}else if(rs==ee && re == ie){ b=1;
-					}else if(rs ==is && re == ie){ e=1;}
-			}
-			if(a+b+c+d+e > 0){
-				print $1,$2,$3,$4,$5,$6,a,b,c,d,e;
-			}
-		}'  | groupBy -g 1,2,3,4,5,6 -c 7,8,9,10,11 -o sum,sum,sum,sum,sum
-	done
-}
 
 count_bed(){
     BED=$1; BAM=$2;
